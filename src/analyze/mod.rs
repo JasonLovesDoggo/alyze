@@ -121,7 +121,7 @@ impl ReusableBuffer {
         Self {
             a: String::new(),
             b: String::new(),
-            stemming_cache: StemmingCache::new_with_capacity(32_000),
+            stemming_cache: StemmingCache::new_with_capacity(128_000),
         }
     }
 

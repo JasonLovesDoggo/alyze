@@ -27,7 +27,7 @@ impl StemmingCacheEntry {
 
 // We'll use a short token type to avoid caching larger tokens, which are
 // less likely to benefit from caching (rarer).
-pub type CachedToken = ShortToken<10>;
+pub type CachedToken = ShortToken<20>;
 
 impl StemmingCache {
     pub fn new_with_capacity(capacity: usize) -> Self {
