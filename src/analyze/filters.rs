@@ -48,7 +48,7 @@ pub(crate) fn is_stopword_in_language(language: LanguageWithStopwords, token: &s
     match language {
         LanguageWithStopwords::Danish => stopwords::DANISH.contains(token),
         LanguageWithStopwords::Dutch => stopwords::DUTCH.contains(token),
-        LanguageWithStopwords::English => stopwords::ENGLISH.contains(token),
+        LanguageWithStopwords::English => is_english_stopword(token),
         LanguageWithStopwords::Finnish => stopwords::FINNISH.contains(token),
         LanguageWithStopwords::French => stopwords::FRENCH.contains(token),
         LanguageWithStopwords::German => stopwords::GERMAN.contains(token),
@@ -59,6 +59,57 @@ pub(crate) fn is_stopword_in_language(language: LanguageWithStopwords, token: &s
         LanguageWithStopwords::Russian => stopwords::RUSSIAN.contains(token),
         LanguageWithStopwords::Spanish => stopwords::SPANISH.contains(token),
         LanguageWithStopwords::Swedish => stopwords::SWEDISH.contains(token),
+    }
+}
+
+#[inline(always)]
+pub(crate) fn is_english_stopword(token: &str) -> bool {
+    // Same list used by Apache Lucene's EnglishAnalyzer.
+    // c.f. https://github.com/apache/lucene/blob/d5d6dc079395c47cd6d12dcce3bcfdd2c7d9dc63/lucene/analysis/common/src/java/org/apache/lucene/analysis/en/EnglishAnalyzer.java#L46
+    let bytes = token.as_bytes();
+    match bytes.len() {
+        1 => bytes[0] == b'a',
+        2 => match bytes[0] {
+            b'a' => matches!(bytes[1], b'n' | b's' | b't'),
+            b'b' => matches!(bytes[1], b'e' | b'y'),
+            b'i' => matches!(bytes[1], b'f' | b'n' | b's' | b't'),
+            b'n' => bytes[1] == b'o',
+            b'o' => matches!(bytes[1], b'f' | b'n' | b'r'),
+            b't' => bytes[1] == b'o',
+            _ => false,
+        },
+        3 => match bytes[0] {
+            b'a' => bytes[1] == b'n' && bytes[2] == b'd' || bytes[1] == b'r' && bytes[2] == b'e',
+            b'b' => bytes[1] == b'u' && bytes[2] == b't',
+            b'f' => bytes[1] == b'o' && bytes[2] == b'r',
+            b'n' => bytes[1] == b'o' && bytes[2] == b't',
+            b't' => bytes[1] == b'h' && bytes[2] == b'e',
+            b'w' => bytes[1] == b'a' && bytes[2] == b's',
+            _ => false,
+        },
+        4 => match bytes[0] {
+            b'i' => bytes[1] == b'n' && bytes[2] == b't' && bytes[3] == b'o',
+            b's' => bytes[1] == b'u' && bytes[2] == b'c' && bytes[3] == b'h',
+            b't' => {
+                bytes[1] == b'h'
+                    && matches!(
+                        (bytes[2], bytes[3]),
+                        (b'a', b't') | (b'e', b'n') | (b'e', b'y') | (b'i', b's')
+                    )
+            }
+            b'w' => bytes[1] == b'i' && matches!((bytes[2], bytes[3]), (b'l', b'l') | (b't', b'h')),
+            _ => false,
+        },
+        5 => {
+            bytes[0] == b't'
+                && bytes[1] == b'h'
+                && bytes[2] == b'e'
+                && matches!(
+                    (bytes[3], bytes[4]),
+                    (b'i', b'r') | (b'r', b'e') | (b's', b'e')
+                )
+        }
+        _ => false,
     }
 }
 
@@ -1558,7 +1609,7 @@ fn fold_non_ascii_char(c: char) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use crate::analyze::{
-        filters::{MAX_LOWERCASED_BYTE_LENGTH, lowercase_chars_in_place},
+        filters::{MAX_LOWERCASED_BYTE_LENGTH, is_english_stopword, lowercase_chars_in_place},
         u17_to_lower::unicode_v17_char_to_lower,
     };
 
@@ -1615,6 +1666,21 @@ mod tests {
             let mut s = input.to_string();
             lowercase_chars_in_place(&mut s);
             assert_eq!(&s, *expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_english_stopwords() {
+        for stopword in [
+            "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into",
+            "is", "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then",
+            "there", "these", "they", "this", "to", "was", "will", "with",
+        ] {
+            assert!(is_english_stopword(stopword), "stopword: {stopword}");
+        }
+
+        for token in ["", "The", "therefore", "within", "hello", "中文"] {
+            assert!(!is_english_stopword(token), "token: {token}");
         }
     }
 }

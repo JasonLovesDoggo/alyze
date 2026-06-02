@@ -64,14 +64,6 @@ pub const DUTCH: phf::Set<&'static str> = phf::phf_set! {
     "andere",
 };
 
-// This is the same list of words used by the Apache-licensed Lucene project,
-// c.f. https://github.com/apache/lucene/blob/d5d6dc079395c47cd6d12dcce3bcfdd2c7d9dc63/lucene/analysis/common/src/java/org/apache/lucene/analysis/en/EnglishAnalyzer.java#L46
-pub const ENGLISH: phf::Set<&'static str> = phf::phf_set! {
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
-    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
-    "they", "this", "to", "was", "will", "with",
-};
-
 pub const FINNISH: phf::Set<&'static str> = phf::phf_set! {
     "olla",
     "olen",
