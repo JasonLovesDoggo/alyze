@@ -20,8 +20,8 @@
 //! value is one (high-nibble set, low-nibble set) product term.
 
 use std::arch::aarch64::{
-    uint8x16_t, vandq_u8, vdupq_n_u8, vgetq_lane_u64, vld1q_u8, vorrq_u8, vpaddq_u8, vqtbl1q_u8,
-    vreinterpretq_u64_u8, vshrq_n_u8, vtstq_u8,
+    uint8x16_t, vandq_u8, vcltq_u8, vdupq_n_u8, vgetq_lane_u64, vld1q_u8, vorrq_u8, vpaddq_u8,
+    vqtbl1q_u8, vreinterpretq_u64_u8, vshrq_n_u8, vtstq_u8,
 };
 
 // Product terms. Each is a (high nibbles, low nibbles) rectangle of the byte table.
@@ -36,6 +36,7 @@ const T_NEWLINE: u8 = 0x80; // hi 0,   lo A-D: LF VT FF CR
 
 const WORD: u8 = T_DIGIT | T_LETTER1 | T_LETTER2 | T_UNDERSCORE;
 const ALNUM: u8 = T_DIGIT | T_LETTER1 | T_LETTER2;
+const LETTERS: u8 = T_LETTER1 | T_LETTER2;
 const NEEDS_DFA: u8 = T_MIDQUOTE | T_MIDCOLON | T_NEWLINE;
 
 const LO_LUT: [u8; 16] = {
@@ -75,6 +76,7 @@ pub(super) struct BlockMasks {
     pub(super) space: u64,
     pub(super) solo: u64,
     pub(super) alnum: u64,
+    pub(super) upper: u64,
     pub(super) x: u64,
 }
 
@@ -84,6 +86,7 @@ impl BlockMasks {
         space: 0,
         solo: 0,
         alnum: 0,
+        upper: 0,
         x: !0,
     };
 }
@@ -120,6 +123,13 @@ fn classify64(chunk: &[u8; 64]) -> BlockMasks {
         let word = movemask(cls.map(|c| vtstq_u8(c, vdupq_n_u8(WORD))));
         let alnum = movemask(cls.map(|c| vtstq_u8(c, vdupq_n_u8(ALNUM))));
         let space = movemask(cls.map(|c| vtstq_u8(c, vdupq_n_u8(T_SPACE))));
+        // A-Z are the letters below 'a' (0x61); the class test already excludes digits etc.
+        let upper = movemask(std::array::from_fn(|i| {
+            vandq_u8(
+                vtstq_u8(cls[i], vdupq_n_u8(LETTERS)),
+                vcltq_u8(raw[i], vdupq_n_u8(b'a')),
+            )
+        }));
         let x = movemask(std::array::from_fn(|i| {
             vorrq_u8(
                 vtstq_u8(cls[i], vdupq_n_u8(NEEDS_DFA)),
@@ -131,6 +141,7 @@ fn classify64(chunk: &[u8; 64]) -> BlockMasks {
             space,
             solo: !(word | space | x),
             alnum,
+            upper,
             x,
         }
     }
@@ -162,18 +173,19 @@ mod tests {
     /// table: word/space/solo cover exactly the ASCII bytes whose `WordBreakProperty` is
     /// ALetter/Numeric/ExtendNumLet, WSegSpace, and Other respectively; everything else
     /// (including all non-ASCII) must go to the DFA.
-    fn reference(b: u8) -> (bool, bool, bool, bool, bool) {
+    fn reference(b: u8) -> (bool, bool, bool, bool, bool, bool) {
+        let upper = b.is_ascii_uppercase();
         if b >= 0x80 {
-            return (false, false, false, false, true);
+            return (false, false, false, false, false, true);
         }
         match ASCII_WORD_BREAK_PROP[b as usize] {
             WordBreakProperty::ALetter | WordBreakProperty::Numeric => {
-                (true, false, false, true, false)
+                (true, false, false, true, upper, false)
             }
-            WordBreakProperty::ExtendNumLet => (true, false, false, false, false),
-            WordBreakProperty::WSegSpace => (false, true, false, false, false),
-            WordBreakProperty::Other => (false, false, true, false, false),
-            _ => (false, false, false, false, true),
+            WordBreakProperty::ExtendNumLet => (true, false, false, false, false, false),
+            WordBreakProperty::WSegSpace => (false, true, false, false, false, false),
+            WordBreakProperty::Other => (false, false, true, false, false, false),
+            _ => (false, false, false, false, false, true),
         }
     }
 
@@ -181,7 +193,7 @@ mod tests {
     #[test]
     fn classes_match_word_break_table() {
         for b in 0..=255u8 {
-            let (word, space, solo, alnum, x) = reference(b);
+            let expected = reference(b);
             for lane in 0..64 {
                 let mut block = [b'a'; 64];
                 block[lane] = b;
@@ -192,13 +204,10 @@ mod tests {
                     bit(masks.space),
                     bit(masks.solo),
                     bit(masks.alnum),
+                    bit(masks.upper),
                     bit(masks.x),
                 );
-                assert_eq!(
-                    got,
-                    (word, space, solo, alnum, x),
-                    "byte {b:#04x} lane {lane}"
-                );
+                assert_eq!(got, expected, "byte {b:#04x} lane {lane}");
             }
         }
     }

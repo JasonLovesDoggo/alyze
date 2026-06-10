@@ -163,8 +163,25 @@ impl Analyzer {
         &self,
         inputs: impl Iterator<Item = &'a str>,
         buffer: &mut ReusableBuffer,
+        callback: impl FnMut(Token<'_>) -> bool,
+    ) {
+        // Monomorphize on case sensitivity: the case-sensitive instantiation provably never
+        // reads `TokenProperties::has_ascii_uppercase`, which lets the compiler strip that
+        // bit's bookkeeping from its tokenizer fast path entirely.
+        if self.options.case_sensitive {
+            self.analyze_inputs_impl::<true>(inputs, buffer, callback)
+        } else {
+            self.analyze_inputs_impl::<false>(inputs, buffer, callback)
+        }
+    }
+
+    fn analyze_inputs_impl<'a, const CASE_SENSITIVE: bool>(
+        &self,
+        inputs: impl Iterator<Item = &'a str>,
+        buffer: &mut ReusableBuffer,
         mut callback: impl FnMut(Token<'_>) -> bool,
     ) {
+        debug_assert_eq!(CASE_SENSITIVE, self.options.case_sensitive);
         let ReusableBuffer {
             a: buffer_a,
             b: buffer_b,
@@ -221,8 +238,8 @@ impl Analyzer {
                 }
 
                 // Lowercasing
-                if !self.options.case_sensitive {
-                    token_text.lowercase_in_place(props.is_ascii());
+                if !CASE_SENSITIVE {
+                    token_text.lowercase_in_place(props.is_ascii(), props.has_ascii_uppercase());
                 }
 
                 // Stopword removal
@@ -244,9 +261,9 @@ impl Analyzer {
 
                     // ASCII folding can produce uppercase ASCII characters,
                     // so we'll lowercase again if case folding is enabled.
-                    if !self.options.case_sensitive {
+                    if !CASE_SENSITIVE {
                         let is_ascii = token_text.as_str().is_ascii();
-                        token_text.lowercase_in_place(is_ascii);
+                        token_text.lowercase_in_place(is_ascii, true);
                     }
                 }
 
@@ -287,7 +304,19 @@ impl InputRefOrBuffered<'_, '_> {
         }
     }
 
-    fn lowercase_in_place(&mut self, is_ascii: bool) {
+    /// `may_have_upper` is a hint from the tokenizer: already-lowercase ASCII tokens (the
+    /// overwhelmingly common case in prose) return immediately, without rescanning the
+    /// bytes. Pass `true` when unknown.
+    #[inline(always)]
+    fn lowercase_in_place(&mut self, is_ascii: bool, may_have_upper: bool) {
+        if is_ascii && !may_have_upper {
+            debug_assert!(!self.as_str().bytes().any(|b| b.is_ascii_uppercase()));
+            return;
+        }
+        self.lowercase_in_place_slow(is_ascii);
+    }
+
+    fn lowercase_in_place_slow(&mut self, is_ascii: bool) {
         debug_assert_eq!(
             is_ascii,
             self.as_str().is_ascii(),
