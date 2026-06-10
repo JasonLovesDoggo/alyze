@@ -16,6 +16,11 @@ use crate::analyze::StemmingLanguage;
 #[derive(Debug, Clone)]
 pub struct StemmingCache {
     cache: AHashMap<CacheKey, StemOutcome>,
+    /// Small direct-mapped cache in front of `cache`. The main map is ~1.5 MiB, so every
+    /// probe of it is effectively an L2 access; the Zipf head of the token stream is hot
+    /// enough that a 48 KiB front absorbs roughly half the lookups at L1 latency. Slots are
+    /// clobbered on promotion, so hot tokens win them back immediately.
+    front: Box<[(CacheKey, StemOutcome)]>,
     language: Option<StemmingLanguage>,
 }
 
@@ -23,6 +28,18 @@ pub struct StemmingCache {
 /// text (vs ~95.9% at 10).
 const MAX_KEY_LEN: usize = 14;
 const MAX_APPEND_LEN: usize = 6;
+
+/// 2048 x 24-byte entries = 48 KiB.
+const FRONT_SLOTS: usize = 2048;
+
+/// Never equal to a real key (keys are non-empty), so vacant slots can't match.
+const VACANT: (CacheKey, StemOutcome) = (
+    ShortToken {
+        valid_length: 0,
+        buffer: [0; MAX_KEY_LEN],
+    },
+    StemOutcome::Unchanged,
+);
 
 /// Reconstructed stems are at most the kept key prefix plus the append suffix.
 pub(crate) const MAX_STEM_LEN: usize = MAX_KEY_LEN + MAX_APPEND_LEN;
@@ -33,6 +50,7 @@ impl StemmingCache {
     pub fn new_with_capacity(capacity: usize) -> Self {
         Self {
             cache: AHashMap::with_capacity(capacity),
+            front: vec![VACANT; FRONT_SLOTS].into_boxed_slice(),
             language: None,
         }
     }
@@ -42,25 +60,36 @@ impl StemmingCache {
     pub(crate) fn prepare(&mut self, language: StemmingLanguage) {
         if self.language != Some(language) {
             self.cache.clear();
+            self.front.fill(VACANT);
             self.language = Some(language);
         }
     }
 
-    pub(crate) fn lookup(&self, key: &CacheKey) -> Option<&StemOutcome> {
-        self.cache.get(key)
+    pub(crate) fn lookup(&mut self, key: &CacheKey) -> Option<&StemOutcome> {
+        use std::hash::BuildHasher;
+        let slot = self.cache.hasher().hash_one(key) as usize & (FRONT_SLOTS - 1);
+        if self.front[slot].0 != *key {
+            let outcome = *self.cache.get(key)?;
+            self.front[slot] = (*key, outcome);
+        }
+        Some(&self.front[slot].1)
     }
 
-    /// Inserts an outcome if there is spare capacity; the cache never evicts or grows.
+    /// Inserts an outcome if there is spare capacity; the main map never evicts or grows.
     pub(crate) fn insert(&mut self, key: CacheKey, outcome: StemOutcome) {
+        use std::hash::BuildHasher;
         if self.cache.len() < self.cache.capacity() {
             let clobbered = self.cache.insert(key, outcome);
             debug_assert!(clobbered.is_none(), "lookup misses should precede inserts");
+            // Fresh stems are usually about to repeat (topical words), so front them too.
+            let slot = self.cache.hasher().hash_one(&key) as usize & (FRONT_SLOTS - 1);
+            self.front[slot] = (key, outcome);
         }
     }
 }
 
 /// The result of stemming one token, encoded relative to its cache key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum StemOutcome {
     Unchanged,
     /// The stem is `key[..keep] ++ append[..append_len]`.
@@ -184,6 +213,29 @@ mod tests {
     #[test]
     fn oversized_diffs_are_not_cached() {
         assert_eq!(roundtrip("shorten", "completelydifferent"), None);
+    }
+
+    #[test]
+    fn front_cache_serves_same_outcomes() {
+        use super::StemmingCache;
+        use crate::analyze::StemmingLanguage;
+
+        let mut cache = StemmingCache::new_with_capacity(100);
+        cache.prepare(StemmingLanguage::English);
+        let key = CacheKey::new_from_str("running").unwrap();
+        let outcome = StemOutcome::encode(&key, "run").unwrap();
+        cache.insert(key, outcome);
+
+        let mut buf = [0; MAX_STEM_LEN];
+        // First lookup may promote from the main map; the second is served by the front.
+        for _ in 0..2 {
+            let got = cache.lookup(&key).unwrap().reconstruct(&key, &mut buf);
+            assert_eq!(got, Some("run"));
+        }
+
+        // A language switch must clear the front as well as the main map.
+        cache.prepare(StemmingLanguage::German);
+        assert!(cache.lookup(&key).is_none());
     }
 
     #[test]
