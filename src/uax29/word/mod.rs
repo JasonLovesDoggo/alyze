@@ -23,6 +23,7 @@ pub struct TokenProperties(u8);
 impl TokenProperties {
     const WORD_LIKE_MASK: u8 = 0b0000_0001;
     const NON_ASCII_MASK: u8 = 0b0000_0010;
+    const ASCII_UPPER_MASK: u8 = 0b0000_0100;
 
     pub(crate) const NON_ASCII: Self = Self(Self::NON_ASCII_MASK);
     pub(crate) const WORD_LIKE: Self = Self(Self::WORD_LIKE_MASK);
@@ -41,6 +42,12 @@ impl TokenProperties {
     // `is_ascii()` returns true when the bit is unset (vacuously true for the empty span).
     pub fn is_ascii(&self) -> bool {
         self.0 & Self::NON_ASCII_MASK == 0
+    }
+
+    // True if the span contains an ASCII `A-Z` byte. Lets case folding skip already-lowercase
+    // ASCII tokens (the overwhelmingly common case in prose) without rescanning them.
+    pub fn has_ascii_uppercase(&self) -> bool {
+        self.0 & Self::ASCII_UPPER_MASK != 0
     }
 }
 
@@ -156,19 +163,24 @@ fn tokenize_impl<const SIMD: bool>(
                     while boundaries != 0 {
                         let i = boundaries.trailing_zeros() as usize;
                         boundaries &= boundaries - 1;
+                        let run = low_bits(i) & !low_bits(run_start);
                         let mut props = std::mem::take(&mut token_props);
-                        if block.alnum & low_bits(i) & !low_bits(run_start) != 0 {
-                            props |= TokenProperties::WORD_LIKE;
-                        }
+                        // Branchless: capitalization is unpredictable, so an `if` here
+                        // would mispredict often enough to show up in benchmarks.
+                        props.0 |= (u8::from(block.alnum & run != 0)
+                            * TokenProperties::WORD_LIKE_MASK)
+                            | (u8::from(block.upper & run != 0)
+                                * TokenProperties::ASCII_UPPER_MASK);
                         if !on_breakpoint(block_base + i, props) {
                             return;
                         }
                         run_start = i;
                     }
                     // The trailing partial run continues as the in-progress token.
-                    if block.alnum & low_bits(limit) & !low_bits(run_start) != 0 {
-                        token_props |= TokenProperties::WORD_LIKE;
-                    }
+                    let tail = low_bits(limit) & !low_bits(run_start);
+                    token_props.0 |= (u8::from(block.alnum & tail != 0)
+                        * TokenProperties::WORD_LIKE_MASK)
+                        | (u8::from(block.upper & tail != 0) * TokenProperties::ASCII_UPPER_MASK);
 
                     pos = block_base + limit;
                     state = if block.word >> (limit - 1) & 1 != 0 {
@@ -346,17 +358,21 @@ const WORD_BREAK_CONTRIB: [TokenProperties; WordBreakProperty::NUM_VARIANTS] = {
 
 /// Per-ASCII-byte info for the fast-path scan and the single-char branch.
 /// - Bit 7 (`ASCII_WORD_CONTINUE`): byte is part of a word-like run (`[a-zA-Z0-9_]`).
-/// - Low bits: the byte's `TokenProperties` contribution (currently just `WORD_LIKE_MASK` for
-///   `[a-zA-Z0-9]`, since underscore continues the run but isn't itself word-like).
+/// - Low bits: the byte's `TokenProperties` contribution (`WORD_LIKE_MASK` for `[a-zA-Z0-9]`
+///   — underscore continues the run but isn't itself word-like — plus `ASCII_UPPER_MASK`
+///   for `[A-Z]`).
 const ASCII_WORD_CONTINUE: u8 = 0b1000_0000;
 const ASCII_BYTE_INFO: [u8; 128] = {
     let mut t = [0u8; 128];
     let mut i = 0u8;
     loop {
         t[i as usize] = match i {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
-                ASCII_WORD_CONTINUE | TokenProperties::WORD_LIKE_MASK
+            b'A'..=b'Z' => {
+                ASCII_WORD_CONTINUE
+                    | TokenProperties::WORD_LIKE_MASK
+                    | TokenProperties::ASCII_UPPER_MASK
             }
+            b'a'..=b'z' | b'0'..=b'9' => ASCII_WORD_CONTINUE | TokenProperties::WORD_LIKE_MASK,
             b'_' => ASCII_WORD_CONTINUE,
             _ => 0,
         };
@@ -599,6 +615,34 @@ mod tests {
         // The sharp case: the breaking char is non-ASCII but starts the *next* token, so "ab"
         // must still report is_ascii=true and "🛑" must report is_ascii=false.
         assert_props("ab🛑", vec![(0, true), (2, true), (6, false)]);
+    }
+
+    /// `has_ascii_uppercase` must reflect A-Z presence per span, regardless of which path
+    /// (SIMD engine, scalar fast path, or DFA) consumed the bytes.
+    #[test]
+    fn tokenizer_uppercase_props() {
+        fn assert_upper(s: &str, expected: Vec<(usize, bool)>) {
+            let mut got: Vec<(usize, bool)> = Vec::new();
+            tokenize(s, Options::default(), |bp, props| {
+                got.push((bp, props.has_ascii_uppercase()));
+                true
+            });
+            assert_eq!(got, expected, "input: {:?}", s);
+        }
+
+        assert_upper("hello", vec![(0, false), (5, false)]);
+        assert_upper("Hello", vec![(0, false), (5, true)]);
+        assert_upper("heLLo", vec![(0, false), (5, true)]);
+        assert_upper("Hi lo", vec![(0, false), (2, true), (3, false), (5, false)]);
+        // Mid-token punctuation routes through the DFA; the bit must survive that path.
+        // ("e.G" holds together via WB6/WB7; the trailing "." is its own token.)
+        assert_upper(
+            "e.G. x",
+            vec![(0, false), (3, true), (4, false), (5, false), (6, false)],
+        );
+        // Mixed ASCII uppercase + non-ASCII: both bits can be set on one span.
+        assert_upper("Aé", vec![(0, false), ("Aé".len(), true)]);
+        assert_upper("éa", vec![(0, false), ("éa".len(), false)]);
     }
 
     fn assert_word_like(s: &str, expected: Vec<(usize, bool)>) {
