@@ -1,5 +1,5 @@
 use crate::{
-    analyze::stemming_cache::{CachedToken, StemmingCache, StemmingCacheEntry},
+    analyze::stemming_cache::{CacheKey, StemOutcome, StemmingCache},
     uax29,
 };
 
@@ -59,7 +59,7 @@ pub enum LanguageWithStopwords {
     Swedish,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum StemmingLanguage {
     Arabic,
     Danish,
@@ -175,6 +175,11 @@ impl Analyzer {
             let algorithm = stemming_language.into();
             rust_stemmers::Stemmer::create(algorithm)
         });
+        if let Some(language) = self.options.stemming {
+            // Cached stems are language-specific; reusing this buffer with a different
+            // stemming language must not serve stale entries.
+            stemming_cache.prepare(language);
+        }
 
         // Monotonic across all inputs. Every word-like token consumes
         // a position, even if a downstream filter (length, stopword) drops it,
@@ -347,14 +352,13 @@ impl InputRefOrBuffered<'_, '_> {
         cache: &mut StemmingCache,
         scratch: &mut String,
     ) {
-        let token_str = self.as_str();
-
-        let cache_key = CachedToken::new_from_str(token_str);
-        if let Some(cache_key) = cache_key.as_ref()
-            && let Some(entry) = cache.lookup(cache_key)
+        let cache_key = CacheKey::new_from_str(self.as_str());
+        if let Some(key) = cache_key.as_ref()
+            && let Some(outcome) = cache.lookup(key)
         {
-            match entry {
-                StemmingCacheEntry::Stemmed(s) => match self {
+            let mut stem_buf = [0; stemming_cache::MAX_STEM_LEN];
+            if let Some(stem) = outcome.reconstruct(key, &mut stem_buf) {
+                match self {
                     Self::InputRef {
                         buffer_if_needed, ..
                     } => {
@@ -362,59 +366,63 @@ impl InputRefOrBuffered<'_, '_> {
                             buffer_if_needed.is_empty(),
                             "buffer must be empty when passed in for potential reuse"
                         );
-                        buffer_if_needed.push_str(s.as_str());
+                        buffer_if_needed.push_str(stem);
                         self.transition_to_buffered();
                     }
                     Self::Buffered(buf) => {
                         buf.clear();
-                        buf.push_str(s.as_str());
+                        buf.push_str(stem);
                     }
-                },
-                StemmingCacheEntry::Unchanged => {}
+                }
             }
             return;
         }
 
-        let cached_value_to_insert = match self {
+        let outcome_to_insert = match self {
             Self::InputRef {
                 input,
                 buffer_if_needed,
             } => {
                 let stemmed = stemmer.stem(input);
                 if stemmed == *input {
-                    Some(StemmingCacheEntry::Unchanged)
+                    Some(StemOutcome::Unchanged)
                 } else {
                     debug_assert!(
                         buffer_if_needed.is_empty(),
                         "buffer must be empty when passed in for potential reuse"
                     );
+                    let outcome = cache_key
+                        .as_ref()
+                        .and_then(|key| StemOutcome::encode(key, &stemmed));
                     buffer_if_needed.push_str(&stemmed);
                     self.transition_to_buffered();
-                    CachedToken::new_from_str(&stemmed).map(StemmingCacheEntry::Stemmed)
+                    outcome
                 }
             }
             Self::Buffered(s) => {
                 let stemmed = stemmer.stem(s.as_str());
                 if stemmed == s.as_str() {
-                    Some(StemmingCacheEntry::Unchanged)
+                    Some(StemOutcome::Unchanged)
                 } else {
                     debug_assert!(
                         scratch.is_empty(),
                         "scratch buffer must be empty when passed in for potential reuse"
                     );
+                    let outcome = cache_key
+                        .as_ref()
+                        .and_then(|key| StemOutcome::encode(key, &stemmed));
                     scratch.push_str(&stemmed);
                     std::mem::swap(*s, scratch);
                     scratch.clear(); // cleanup for caller's next use
-                    CachedToken::new_from_str(s.as_str()).map(StemmingCacheEntry::Stemmed)
+                    outcome
                 }
             }
         };
 
-        if let Some(cache_key) = cache_key
-            && let Some(cache_value) = cached_value_to_insert
-            && cache.has_remaining_capacity()
+        if let Some(key) = cache_key
+            && let Some(outcome) = outcome_to_insert
         {
-            cache.insert_no_clobber_assume_capacity(cache_key, cache_value);
+            cache.insert(key, outcome);
         }
     }
 
@@ -440,3 +448,101 @@ impl InputRefOrBuffered<'_, '_> {
 
 // TODO this has extensive coverage in the turbopuffer repo, but not in the crate itself
 // move some of the test suite in here
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect(
+        analyzer: &Analyzer,
+        buffer: &mut ReusableBuffer,
+        input: &str,
+    ) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        analyzer.analyze(input, buffer, |token| {
+            out.push((token.text.to_string(), token.position));
+            true
+        });
+        out
+    }
+
+    fn full_english() -> AnalysisOptions {
+        AnalysisOptions {
+            tokenizer: TokenizerOptions::UAX29Word(crate::uax29::word::Options::default()),
+            maximum_token_length: Some(40),
+            case_sensitive: false,
+            stopword_removal: Some(StopwordRemoval::ForLanguage(LanguageWithStopwords::English)),
+            stemming: Some(StemmingLanguage::English),
+            ascii_folding: true,
+        }
+    }
+
+    #[test]
+    fn full_pipeline_output() {
+        let analyzer = Analyzer::new(full_english());
+        let mut buffer = ReusableBuffer::new();
+        // "The" and "are" are stopwords but still consume positions.
+        assert_eq!(
+            collect(&analyzer, &mut buffer, "The quick Foxes are running"),
+            vec![
+                ("quick".to_string(), 1),
+                ("fox".to_string(), 2),
+                ("run".to_string(), 4)
+            ]
+        );
+    }
+
+    /// The token cache must be transparent: a cold pass (all misses, running the real
+    /// filter chain) and a warm pass (served from cache) must produce identical output.
+    /// Inputs cover ASCII/Unicode case folding, folding-induced growth, skip outcomes,
+    /// tokens too long to cache, and outputs too divergent to encode.
+    #[test]
+    fn cache_is_transparent() {
+        let analyzer = Analyzer::new(full_english());
+        let mut buffer = ReusableBuffer::new();
+        let input = "The quick brown Foxes are running and THEIR happiness is \
+                     internationalization! Wikipedia café Дом ПРИВЕТМИР İstanbul ﬃ \
+                     e.g. can't 1,000 _connector_ a\u{0301} León supercalifragilistic";
+        let cold = collect(&analyzer, &mut buffer, input);
+        let warm = collect(&analyzer, &mut buffer, input);
+        assert!(!cold.is_empty());
+        assert_eq!(cold, warm);
+    }
+
+    /// Skip outcomes served from the cache must still consume token positions
+    /// (phrase-distance accuracy depends on this).
+    #[test]
+    fn cached_skips_consume_positions() {
+        let analyzer = Analyzer::new(AnalysisOptions {
+            maximum_token_length: Some(5),
+            ..full_english()
+        });
+        let mut buffer = ReusableBuffer::new();
+        let input = "the extraordinary cat the extraordinary cat";
+        let expected = vec![("cat".to_string(), 2), ("cat".to_string(), 5)];
+        assert_eq!(collect(&analyzer, &mut buffer, input), expected);
+        // Warm pass: every skip now comes from the cache.
+        assert_eq!(collect(&analyzer, &mut buffer, input), expected);
+    }
+
+    /// Sharing a `ReusableBuffer` across differently-configured analyzers must not leak
+    /// cached outcomes between configurations.
+    #[test]
+    fn cache_cleared_on_options_change() {
+        let english = Analyzer::new(full_english());
+        let german = Analyzer::new(AnalysisOptions {
+            stopword_removal: Some(StopwordRemoval::ForLanguage(LanguageWithStopwords::German)),
+            stemming: Some(StemmingLanguage::German),
+            ..full_english()
+        });
+        let input = "connection connection";
+
+        let mut shared = ReusableBuffer::new();
+        let english_out = collect(&english, &mut shared, input);
+        let german_via_shared = collect(&german, &mut shared, input);
+        let german_fresh = collect(&german, &mut ReusableBuffer::new(), input);
+        assert_eq!(german_via_shared, german_fresh);
+        // Sanity: the two configurations actually disagree on this input.
+        assert_ne!(english_out, german_via_shared);
+    }
+}

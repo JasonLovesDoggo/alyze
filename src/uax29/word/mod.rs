@@ -1,4 +1,6 @@
 pub(crate) mod properties;
+#[cfg(target_arch = "aarch64")]
+mod simd;
 pub(crate) mod transitions;
 
 use crate::uax29::Action;
@@ -55,6 +57,16 @@ impl std::ops::BitOrAssign for TokenProperties {
 pub fn tokenize(
     text: &str,
     _options: Options,
+    on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
+) {
+    // On aarch64, simple ASCII runs are handled by a NEON block engine (see `simd`); the
+    // scalar fast path covers other architectures. Both instantiations stay compilable and
+    // are compared against each other in `tests::simd_and_scalar_agree`.
+    tokenize_impl::<{ cfg!(target_arch = "aarch64") }>(text, on_breakpoint)
+}
+
+fn tokenize_impl<const SIMD: bool>(
+    text: &str,
     mut on_breakpoint: impl FnMut(usize, TokenProperties) -> bool,
 ) {
     if text.is_empty() {
@@ -87,13 +99,102 @@ pub fn tokenize(
     // they fold into the current token. Tracked by `deferred_break_pos.is_some()`.
     let mut deferred_props = TokenProperties::default();
 
+    // Lazily-classified block for the SIMD fast path; `block_base == usize::MAX` means "no
+    // block classified yet". A block is re-used across DFA round-trips within its 64 bytes.
+    #[cfg(target_arch = "aarch64")]
+    let (mut block_base, mut block) = (usize::MAX, simd::BlockMasks::EMPTY);
+
     while pos < text.len() {
+        // SIMD fast path: consume a run of "simple" ASCII (word chars, spaces, and
+        // unconditionally-breaking punctuation) in one shot. Within such a run, UAX #29
+        // places boundaries exactly at class transitions, plus before every `solo` byte;
+        // everything subtler (non-ASCII, CR/LF, `, . : ; ' "`) is left to the DFA below.
+        #[cfg(target_arch = "aarch64")]
+        if SIMD && !last_was_zwj {
+            // Carried-in class of the previous character, from the DFA state. The state (not
+            // the previous byte's mask bit) is authoritative: WB4-transparent characters
+            // consumed by the DFA leave `state` pointing at the char *before* them.
+            // States with pending context (deferred breaks, Katakana, WB7a) fall back to
+            // the DFA until the ambiguity resolves.
+            let carries = match state {
+                State::ALetter | State::Numeric | State::HLetter | State::ExtendNumLet => {
+                    Some((1u64, 0u64))
+                }
+                State::WSegSpace => Some((0, 1)),
+                State::StartOfText | State::Any | State::CR | State::Newline | State::RIOdd => {
+                    Some((0, 0))
+                }
+                State::Katakana
+                | State::AHLetterMid
+                | State::NumericMid
+                | State::HLetterDQ
+                | State::HLetterSQ => None,
+            };
+            if let Some((carry_word, carry_space)) = carries {
+                debug_assert!(deferred_break_pos.is_none());
+                if pos < block_base || pos - block_base >= 64 {
+                    block_base = pos;
+                    block = simd::classify(bytes, pos);
+                }
+                let off = pos - block_base;
+                // The engine may consume bytes [off, limit); `limit` is the first byte at or
+                // after `off` that needs the DFA (input past the end of `text` is `x` too).
+                let limit = (block.x & !low_bits(off)).trailing_zeros() as usize;
+                if limit > off {
+                    // A boundary falls wherever a byte's class differs from its predecessor's
+                    // (word runs and space runs stay together), plus before every solo byte.
+                    let wprev = ((block.word << 1) & !(1 << off)) | (carry_word << off);
+                    let sprev = ((block.space << 1) & !(1 << off)) | (carry_space << off);
+                    let window = low_bits(limit) & !low_bits(off);
+                    let mut boundaries =
+                        ((block.word ^ wprev) | (block.space ^ sprev) | block.solo) & window;
+
+                    // Emit a breakpoint per boundary. The token ending at boundary `i` is
+                    // word-like if the run leading up to it contains an alphanumeric byte
+                    // (its earlier chars' contributions are already in `token_props`).
+                    let mut run_start = off;
+                    while boundaries != 0 {
+                        let i = boundaries.trailing_zeros() as usize;
+                        boundaries &= boundaries - 1;
+                        let mut props = std::mem::take(&mut token_props);
+                        if block.alnum & low_bits(i) & !low_bits(run_start) != 0 {
+                            props |= TokenProperties::WORD_LIKE;
+                        }
+                        if !on_breakpoint(block_base + i, props) {
+                            return;
+                        }
+                        run_start = i;
+                    }
+                    // The trailing partial run continues as the in-progress token.
+                    if block.alnum & low_bits(limit) & !low_bits(run_start) != 0 {
+                        token_props |= TokenProperties::WORD_LIKE;
+                    }
+
+                    pos = block_base + limit;
+                    state = if block.word >> (limit - 1) & 1 != 0 {
+                        match bytes[pos - 1] {
+                            b'0'..=b'9' => State::Numeric,
+                            b'_' => State::ExtendNumLet,
+                            _ => State::ALetter,
+                        }
+                    } else if block.space >> (limit - 1) & 1 != 0 {
+                        State::WSegSpace
+                    } else {
+                        State::Any // solo punctuation
+                    };
+                    continue;
+                }
+            }
+        }
+
         // Fast path for ASCII, e.g. skip DFA all together when possible.
         // Roughly a ~2x speedup on English Wikipedia.
-        if matches!(
-            state,
-            State::ALetter | State::Numeric | State::ExtendNumLet | State::HLetter
-        ) {
+        if !SIMD
+            && matches!(
+                state,
+                State::ALetter | State::Numeric | State::ExtendNumLet | State::HLetter
+            )
+        {
             let scan_start = pos;
             let mut fast_acc: u8 = 0;
             while pos < text.len() && bytes[pos] < 0x80 {
@@ -224,6 +325,13 @@ pub fn tokenize(
     _ = on_breakpoint(text.len(), token_props);
 }
 
+/// A mask of the `n` lowest bits (`n <= 64`).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn low_bits(n: usize) -> u64 {
+    if n >= 64 { !0 } else { (1 << n) - 1 }
+}
+
 /// Cheap-path `TokenProperties` contribution for each `WordBreakProperty` value. Covers the
 /// signals that fall out of WordBreak alone — letters and digits. Katakana is intentionally
 /// **not** included: its set mixes Katakana letters (word-like) with the prolonged-sound mark
@@ -281,6 +389,83 @@ mod tests {
             passed,
             passed + failed
         );
+    }
+
+    /// Differential test: the SIMD block engine and the scalar fast path must produce
+    /// identical breakpoints *and* token properties. Inputs are random concatenations of
+    /// pieces chosen to exercise every engine edge: class transitions, mid-token
+    /// punctuation (deferred breaks), WB4 transparency, ZWJ sequences, regional
+    /// indicators, Hebrew quotes, katakana, and 64-byte block straddles.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn simd_and_scalar_agree() {
+        const PIECES: &[&str] = &[
+            "a",
+            "Z",
+            "9",
+            "_",
+            " ",
+            "  ",
+            "!",
+            "#",
+            "-",
+            "(",
+            ".",
+            ",",
+            ":",
+            ";",
+            "'",
+            "\"",
+            "\t",
+            "\r",
+            "\n",
+            "\r\n",
+            "\u{0}",
+            "é",
+            "ü",
+            "א",
+            "ク",
+            "ー",
+            "中",
+            "👍",
+            "🛑",
+            "\u{200d}",
+            "\u{0301}",
+            "\u{2060}",
+            "🇦",
+            "e.g.",
+            "can't",
+            "1,000",
+            "א'",
+            "צה\u{5F4}ל",
+            "wordwordwordword",
+            "                ",
+        ];
+        // Simple deterministic LCG; no external dependencies, reproducible failures.
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as usize
+        };
+        for _ in 0..4000 {
+            let mut input = String::new();
+            for _ in 0..(next() % 40 + 1) {
+                input.push_str(PIECES[next() % PIECES.len()]);
+            }
+            let mut simd = Vec::new();
+            super::tokenize_impl::<true>(&input, |bp, props| {
+                simd.push((bp, props));
+                true
+            });
+            let mut scalar = Vec::new();
+            super::tokenize_impl::<false>(&input, |bp, props| {
+                scalar.push((bp, props));
+                true
+            });
+            assert_eq!(simd, scalar, "input: {input:?}");
+        }
     }
 
     #[test]
